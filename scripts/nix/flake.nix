@@ -8,7 +8,7 @@
   };
 
   outputs =
-    inputs:
+    { self, ... }@inputs:
     let
       inherit (inputs.nixpkgs) lib;
       # systems = lib.systems.flakeExposed;
@@ -24,7 +24,7 @@
         ## Broken in `nix flake check`
         # "x86_64-freebsd"
       ];
-      main-overlay = final: previous: {
+      main-overlay = (final: previous: {
         # Override the rustPlatform without forcing a rebuild of _every_ tool as well
         rustToolchain' = previous.rust-bin.fromRustupToolchainFile ../../rust-toolchain.toml;
         rustPlatform' = final.makeRustPlatform {
@@ -60,29 +60,29 @@
           // (builtins.mapAttrs
             (
               pname: d:
-              previous.callPackage ./. (
-                {
-                  pname = "nu_plugin_${pname}";
-                  rustPlatform = final.rustPlatform';
-                  extraCargo = ../../crates + "/nu_plugin_${pname}/Cargo.toml";
-                  buildAndTestSubdir = "crates/nu_plugin_${pname}";
-                  nativeBuildInputs = [
-                    previous.pkg-config
-                  ]
-                  ++ lib.optionals previous.stdenv.cc.isClang [ final.rustPlatform'.bindgenHook ]
-                  ++ (d.extraNativeBuildInputs or [ ]);
-                }
-                // d
-              )
+                previous.callPackage ./. (
+                  {
+                    pname = "nu_plugin_${pname}";
+                    rustPlatform = final.rustPlatform';
+                    extraCargo = ../../crates + "/nu_plugin_${pname}/Cargo.toml";
+                    buildAndTestSubdir = "crates/nu_plugin_${pname}";
+                    nativeBuildInputs = [
+                      previous.pkg-config
+                    ]
+                    ++ lib.optionals previous.stdenv.cc.isClang [ final.rustPlatform'.bindgenHook ]
+                    ++ (d.extraNativeBuildInputs or [ ]);
+                  }
+                  // d
+                )
             )
             {
               formats = { };
               gstat = {
-                buildInputs = [ previous.openssl ];
+                buildInputs = [ previous.openssl previous.libgit2 ];
               };
               inc = { };
               polars = {
-                buildInputs = [ previous.openssl ];
+                buildInputs = [ previous.openssl previous.aws-lc ] ++ final.nushell.buildInputs;
                 checkFlags = [
                   "--skip=dataframe::command::core::to_repr::test::test_examples"
                 ];
@@ -95,7 +95,11 @@
               };
             }
           );
-      };
+      });
+      all-overlays = lib.composeManyExtensions [
+        inputs.rust-overlay.overlays.default
+        main-overlay
+      ];
       forEachSupportedSystem =
         f:
         inputs.nixpkgs.lib.genAttrs systems (
@@ -104,8 +108,7 @@
             pkgs = import inputs.nixpkgs {
               inherit system;
               overlays = [
-                inputs.rust-overlay.overlays.default
-                main-overlay
+                all-overlays
               ];
             };
           }
@@ -114,33 +117,51 @@
     {
       overlays = {
         default = main-overlay;
+        all = all-overlays;
       };
       packages = forEachSupportedSystem (
         { pkgs, ... }:
         {
           inherit (pkgs) nushell;
-          default = pkgs.nushell;
           dev = pkgs.nushell.override {
-            buildType = "dev";
+            buildType = "debug";
+          };
+          default = pkgs.nushell;
+          all-dev = pkgs.symlinkJoin {
+            inherit (pkgs.nushell) version;
+            pname = "nushellAll";
+            paths = [ self.packages.${pkgs.stdenv.hostPlatform.system}.dev ]
+              ++ (builtins.attrValues self.legacyPackages.${pkgs.stdenv.hostPlatform.system}.nushellPluginsDev);
+          };
+          all = pkgs.symlinkJoin {
+            inherit (pkgs.nushell) version;
+            pname = "nushellAll";
+            paths = [ pkgs.nushell ]
+              ++ (builtins.attrValues self.legacyPackages.${pkgs.stdenv.hostPlatform.system}.nushellPlugins);
           };
         }
       );
-      legacyPackages = forEachSupportedSystem (
-        { pkgs, ... }:
-        {
-          nushellPlugins = {
-            # Only getting a subset of these so we don't have _all_ of the
-            # plugins that are in `nixpkgs`
-            inherit (pkgs.nushellPlugins)
-              formats
-              gstat
-              inc
-              polars
-              query
-              ;
-          };
-        }
-      );
+      legacyPackages = forEachSupportedSystem
+        (
+          { pkgs, ... }:
+          {
+            nushellPlugins = {
+              # Only getting a subset of these so we don't have _all_ of the
+              # plugins that are in `nixpkgs`
+              inherit (pkgs.nushellPlugins)
+                formats
+                gstat
+                inc
+                polars
+                query
+                ;
+            };
+            nushellPluginsDev = (lib.mapAttrs
+              (_: plugin: plugin.override { buildType = "debug"; })
+              self.legacyPackages.${pkgs.stdenv.hostPlatform.system}.nushellPlugins
+            );
+          }
+        );
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
         let
@@ -152,15 +173,15 @@
                 openssl
                 pkg-config
                 zstd
+                zlib
+                libgit2
               ]
               ++ (lib.optionals stdenv.hostPlatform.isLinux [
                 python3
                 libX11
               ])
               ++ (lib.optionals stdenv.hostPlatform.isDarwin [
-                zlib
                 nghttp2
-                libgit2
               ])
             );
         in
